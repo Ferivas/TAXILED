@@ -26,9 +26,10 @@ La matriz se conecta de manera que se multiplexan 8 lineas conectados a los anod
 Hay un led conectado a PB2 activado por bajo
 
 ### Pines de programacion
-Existe un puerto de programacion para utilizar un programador de tipo USBASP que utiliza las lineas MOSI,MISO;SCK y RESET del ATMega8
+Existe un puerto de programacion para utilizar un programador de tipo USBASP que utiliza las lineas MOSI,MISO,SCK y RESET del ATMega8
 
-
+## Operacion
+El ATmega8 trabaja con su reloj interno de 8MHz y debe generar interrupciones cada 2ms con un o de sus timers (500Hz) para barrer las columnas. En esa interrupcion, primero se apagan todas las columnas y se apagan todas las salidas de driver de corrriente con la señal OE (deshabilitado), para que  luego se envien los datos de las filas serialmente con las señales de SDI y CLK para luego con la señal de LE dejar el dato retenido en el driver con un registro de 16 bits al A6282, luego habilitar el driver serial (OE habilitado) y luego se enciende la columna correspondiente hasta que se produzca otra interrupcion y barrer una nueva columna. repitiendo este proceso hasta completar los 8 drivers de voltaje.
 ## Programa de prueba
 Implementar un programa que barra las 24 columnas con una linea de 5 pixeles que va de izquierda a derecha y luego una linea de 24 pixeles que barra las 5 filas para comprobar el funcionamiento de la matriz.
 
