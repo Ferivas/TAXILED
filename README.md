@@ -28,10 +28,27 @@ Hay un led conectado a PB2 activado por bajo
 ### Pines de programacion
 Existe un puerto de programacion para utilizar un programador de tipo USBASP que utiliza las lineas MOSI,MISO,SCK y RESET del ATMega8
 
+## Compilación y grabación
+
+### Con PlatformIO
+- Compilar: `pio run`
+- Grabar (con el USBASP conectado): `pio run -e atmega8 -t upload`
+
+### Con avrdude directamente
+Primero compilar con `pio run` para generar `.pio/build/atmega8/firmware.hex` y luego:
+
+```
+avrdude -c usbasp -p m8 -B 10 -U flash:w:.pio/build/atmega8/firmware.hex:i
+```
+
+Nota: el USBASP (clon) corrompe la escritura a la velocidad de SCK por defecto, por eso siempre se usa `-B 10` (SCK lento). Si el avrdude de PlatformIO falla la verificación, repetir con el avrdude del sistema usando el comando anterior.
+
+Fuse de fábrica correctos para este proyecto: `lfuse=0xC4` (RC interno 8 MHz) y `hfuse=0xDD` (sin bootloader, arranca en 0x0000).
+
 ## Operacion
-El ATmega8 trabaja con su reloj interno de 8MHz y debe generar interrupciones cada 2ms con un o de sus timers (500Hz) para barrer las columnas. En esa interrupcion, primero se apagan todas las columnas y se apagan todas las salidas de driver de corrriente con la señal OE (deshabilitado), para que  luego se envien los datos de las filas serialmente con las señales de SDI y CLK para luego con la señal de LE dejar el dato retenido en el driver con un registro de 16 bits al A6282, luego habilitar el driver serial (OE habilitado) y luego se enciende la columna correspondiente hasta que se produzca otra interrupcion y barrer una nueva columna. repitiendo este proceso hasta completar los 8 drivers de voltaje.
-## Programa de prueba
-Implementar un programa que barra las 24 columnas con una linea de 5 pixeles que va de izquierda a derecha y luego una linea de 24 pixeles que barra las 5 filas para comprobar el funcionamiento de la matriz.
+El ATmega8 trabaja con su reloj interno de 8MHz y debe generar interrupciones cada 0,5ms con uno de sus timers (2kHz) para barrer las columnas. En esa interrupcion, primero se apagan todas las columnas y se apagan todas las salidas de driver de corrriente con la señal OE (deshabilitado), para que  luego se envien los datos de las filas serialmente con las señales de SDI y CLK para luego con la señal de LE dejar el dato retenido en el driver con un registro de 16 bits al A6282, luego habilitar el driver serial (OE habilitado) y luego se enciende la columna correspondiente hasta que se produzca otra interrupcion y barrer una nueva columna. repitiendo este proceso hasta completar los 8 drivers de voltaje.
+## Programa actual: reloj
+El firmware muestra la hora `HH:MM` (formato 24h, arranca en 12:00) en la matriz. Los dígitos se dibujan con la fuente 5x4 definida en `docs/Digitos_5x4.ods`. El Timer1 genera la interrupción de 1 segundo para avanzar el reloj y refrescar el framebuffer, y el Timer2 genera el barrido de 2kHz (250 fps). Los dos puntos del centro parpadean una vez por segundo. Un LED de señalización en PB2 titila 100ms cada segundo.
 
 ## Distribucion de los pixeles
 En el archivo Matriz_5x24 se muestar como estan conectados los leds en funcion de los drivers de voltaje (C0,C1, hasta C7 ) y los drivers de corriente (F0, F1, hasta F14)
