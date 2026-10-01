@@ -28,6 +28,10 @@ Hay un led conectado a PB2 activado por bajo
 ### Pines de programacion
 Existe un puerto de programacion para utilizar un programador de tipo USBASP que utiliza las lineas MOSI,MISO,SCK y RESET del ATMega8
 
+### Entradas
+- PD2=INT0: conmutación de orientación. Un pulsador entre PD2 y GND (con pull-up interno) cambia entre reloj horizontal y vertical en el flanco de bajada (antirrebote de 150ms).
+- PD0=RX / PD1=TX: puerto serie 9600 8N1 para sincronizar la hora y ver el registro de actividad.
+
 ## Compilación y grabación
 
 ### Con PlatformIO
@@ -49,6 +53,34 @@ Fuse de fábrica correctos para este proyecto: `lfuse=0xC4` (RC interno 8 MHz) y
 El ATmega8 trabaja con su reloj interno de 8MHz y debe generar interrupciones cada 0,5ms con uno de sus timers (2kHz) para barrer las columnas. En esa interrupcion, primero se apagan todas las columnas y se apagan todas las salidas de driver de corrriente con la señal OE (deshabilitado), para que  luego se envien los datos de las filas serialmente con las señales de SDI y CLK para luego con la señal de LE dejar el dato retenido en el driver con un registro de 16 bits al A6282, luego habilitar el driver serial (OE habilitado) y luego se enciende la columna correspondiente hasta que se produzca otra interrupcion y barrer una nueva columna. repitiendo este proceso hasta completar los 8 drivers de voltaje.
 ## Programa actual: reloj
 El firmware muestra la hora `HH:MM` (formato 24h, arranca en 12:00) en la matriz. Los dígitos se dibujan con la fuente 5x4 definida en `docs/Digitos_5x4.ods`. El Timer1 genera la interrupción de 1 segundo para avanzar el reloj y refrescar el framebuffer, y el Timer2 genera el barrido de 2kHz (250 fps). Los dos puntos del centro parpadean una vez por segundo. Un LED de señalización en PB2 titila 100ms cada segundo.
+
+La orientación del reloj se alterna con un pulso de alto a bajo en PD2 y se guarda en EEPROM, restableciéndose al encender el display:
+- **Horizontal**: `HH:MM` en 23 columnas con el formato habitual.
+- **Vertical**: dígitos rotados 90° leídos de arriba hacia abajo en el orden `Hh:Mm` (H@cols 19-23, h@13-17, dos puntos@11-12, M@6-10, m@0-4). Los dígitos de los minutos se pintan un píxel más a la derecha (filas 1-4) que los de las horas (filas 0-3).
+
+## Puerto serie
+Velocidad **9600 8N1**. Comando para igualar el reloj:
+
+```
+$SETCLK,HHMMSS
+```
+
+- Debe empezar con `$` y terminar con Enter (CR o LF).
+- `HH` horas (00-23), `MM` minutos (00-59), `SS` segundos (00-59). Los segundos no se muestran pero se aplican para que el reloj quede exactamente igualado.
+
+### Registro de actividad (TX)
+El firmware envía por PD1 (TX) un registro para depurar:
+
+- Al encender: `TAXILED 9600 READY`
+- Por cada línea completa recibida: `RX <línea>` (los caracteres no imprimibles salen como `.`)
+- Resultado del procesamiento: `OK` si la hora se aplicó, o uno de estos errores:
+  - `ERR LEN`: la línea no tiene exactamente 13 caracteres después del `$`
+  - `ERR CMD`: no empieza por `SETCLK,`
+  - `ERR DIGIT`: los campos HHMMSS no son todos dígitos
+  - `ERR RANGE`: HH fuera de 00-23 o MM/SS fuera de 00-59
+  - `ERR LONG`: la línea superó el largo máximo y se descartó
+
+Si no aparece el banner ni ningún `RX`, revisar cableado o baudios; si aparece `RX` con `ERR`, es el formato del comando.
 
 ## Distribucion de los pixeles
 En el archivo Matriz_5x24 se muestar como estan conectados los leds en funcion de los drivers de voltaje (C0,C1, hasta C7 ) y los drivers de corriente (F0, F1, hasta F14)

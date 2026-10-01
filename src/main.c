@@ -1,5 +1,6 @@
 #include <avr/io.h>
 #include <avr/interrupt.h>
+#include <avr/eeprom.h>
 #include <util/delay.h>
 #include <stdint.h>
 
@@ -7,14 +8,29 @@
 
 #define LED_PERIOD_TICKS 2000
 #define LED_ON_TICKS 200
+#define DEBOUNCE_MS 150
 
-/* HH:MM ocupa 23 columnas: 4 + 2 + 4 + 3 + 4 + 2 + 4 */
+/* HH:MM horizontal ocupa 23 columnas: 4 + 2 + 4 + 3 + 4 + 2 + 4 */
 #define CLOCK_COL0 0
 #define COL_H1 (CLOCK_COL0 + 0)
 #define COL_H2 (CLOCK_COL0 + 6)
 #define COL_COLON (CLOCK_COL0 + 9) /* pixel en col0+2 = 11 (centro del hueco) */
 #define COL_M1 (CLOCK_COL0 + 13)
 #define COL_M2 (CLOCK_COL0 + 19)
+
+/* Vertical (leído de arriba a abajo con la pantalla rotada 90° CCW, las
+   columnas altas arriba): H@19-23, h@13-17, dos puntos@11-12, M@6-10,
+   m@0-4. Los dígitos de los minutos se pintan una fila más abajo
+   (filas 1-4 = un píxel a la derecha de la vista vertical). */
+#define VC_H1 19  /* hora, decenas */
+#define VC_H2 13  /* hora, unidades */
+#define VC_M1 6   /* minuto, decenas */
+#define VC_M2 0   /* minuto, unidades */
+#define VC_COL_A 11
+#define VC_COL_B 12
+#define VC_MROW 1
+
+#define SETCLK_LEN 13
 
 #define OE_DISABLE() (PORTC |= (1 << PC4))
 #define OE_ENABLE() (PORTC &= ~(1 << PC4))
@@ -46,6 +62,19 @@ static uint8_t minute;
 static uint8_t second;
 static uint8_t shown_minute;
 static uint8_t colon_shown;
+
+static volatile uint8_t orientation;
+static volatile uint8_t eeprom_pending;
+static volatile uint16_t ms_cnt;
+static uint8_t ms_div;
+
+static volatile uint8_t rx_active;
+static volatile uint8_t rx_len;
+static volatile uint8_t rx_buf[SETCLK_LEN];
+static volatile uint8_t rx_ready;
+static volatile uint8_t rx_overflow;
+
+static uint8_t EEMEM ee_orientation;
 
 static void columns_off(void)
 {
@@ -95,23 +124,55 @@ static void draw_glyph(uint8_t col0, uint8_t glyph)
     }
 }
 
+/* Giro 90 horario: (c,r) -> (col0 + 4 - r, row0 + c). Para giro antihorario
+   usar set_pixel(col0 + r, row0 + 3 - c) en su lugar. */
+static void draw_glyph_rot(uint8_t col0, uint8_t row0, uint8_t glyph)
+{
+    for (uint8_t r = 0; r < 5; r++) {
+        uint8_t bits = font[glyph][r];
+        for (uint8_t c = 0; c < 4; c++)
+            if (bits & (1 << c))
+                set_pixel(col0 + (4 - r), row0 + c);
+    }
+}
+
 static void colon_pixels(uint8_t on)
 {
-    for (uint8_t r = 2; r <= 3; r++) {
-        if (on)
-            set_pixel(COL_COLON + 2, r);
-        else
-            clear_pixel(COL_COLON + 2, r);
+    uint8_t c0, c1, r0, r1;
+
+    if (orientation) {
+        c0 = VC_COL_A;
+        c1 = VC_COL_B;
+        r0 = r1 = 2;
+    } else {
+        c0 = c1 = COL_COLON + 2;
+        r0 = 2;
+        r1 = 3;
+    }
+
+    if (on) {
+        set_pixel(c0, r0);
+        set_pixel(c1, r1);
+    } else {
+        clear_pixel(c0, r0);
+        clear_pixel(c1, r1);
     }
 }
 
 static void render_clock(void)
 {
     clear_frame();
-    draw_glyph(COL_H1, hour / 10);
-    draw_glyph(COL_H2, hour % 10);
-    draw_glyph(COL_M1, minute / 10);
-    draw_glyph(COL_M2, minute % 10);
+    if (orientation) {
+        draw_glyph_rot(VC_H1, 0, hour / 10);
+        draw_glyph_rot(VC_H2, 0, hour % 10);
+        draw_glyph_rot(VC_M1, VC_MROW, minute / 10);
+        draw_glyph_rot(VC_M2, VC_MROW, minute % 10);
+    } else {
+        draw_glyph(COL_H1, hour / 10);
+        draw_glyph(COL_H2, hour % 10);
+        draw_glyph(COL_M1, minute / 10);
+        draw_glyph(COL_M2, minute % 10);
+    }
     colon_shown = (second & 1) == 0;
     colon_pixels(colon_shown);
 }
@@ -138,6 +199,71 @@ static void shift_word(uint16_t w)
         PORTB |= (1 << PB5);
         PORTB &= ~(1 << PB5);
     }
+}
+
+static void uart_putc(uint8_t c)
+{
+    while (!(UCSRA & (1 << UDRE)))
+        ;
+    UDR = c;
+}
+
+static void uart_puts(const char *s)
+{
+    while (*s)
+        uart_putc((uint8_t)*s++);
+}
+
+static void setclk_apply(void)
+{
+    static const uint8_t tag[7] = "SETCLK,";
+    uint8_t line[SETCLK_LEN];
+    uint8_t len, i;
+    uint8_t hh, mm, ss;
+
+    cli();
+    len = rx_len;
+    for (i = 0; i < len; i++)
+        line[i] = rx_buf[i];
+    rx_ready = 0;
+    sei();
+
+    uart_puts("RX ");
+    for (i = 0; i < len; i++)
+        uart_putc(line[i] >= 32 && line[i] < 127 ? line[i] : '.');
+    uart_puts("\r\n");
+
+    if (len != SETCLK_LEN) {
+        uart_puts("ERR LEN\r\n");
+        return;
+    }
+    for (i = 0; i < 7; i++)
+        if (line[i] != tag[i]) {
+            uart_puts("ERR CMD\r\n");
+            return;
+        }
+    for (i = 7; i < SETCLK_LEN; i++)
+        if (line[i] < '0' || line[i] > '9') {
+            uart_puts("ERR DIGIT\r\n");
+            return;
+        }
+    hh = (line[7] - '0') * 10 + (line[8] - '0');
+    mm = (line[9] - '0') * 10 + (line[10] - '0');
+    ss = (line[11] - '0') * 10 + (line[12] - '0');
+    if (hh > 23 || mm > 59 || ss > 59) {
+        uart_puts("ERR RANGE\r\n");
+        return;
+    }
+
+    cli();
+    hour = hh;
+    minute = mm;
+    second = ss;
+    render_clock();
+    shown_minute = minute;
+    sei();
+
+    uart_puts("OK\r\n");
 }
 
 ISR(TIMER1_COMPA_vect)
@@ -167,6 +293,11 @@ ISR(TIMER2_COMP_vect)
     else
         LED_OFF();
 
+    if (++ms_div == 2) {
+        ms_div = 0;
+        ms_cnt++;
+    }
+
     shift_word(grp[group]);
 
     PORTB |= (1 << PB0);
@@ -181,6 +312,49 @@ ISR(TIMER2_COMP_vect)
         group = 0;
 }
 
+ISR(INT0_vect)
+{
+    static uint16_t last_press;
+    uint16_t now = ms_cnt;
+
+    if ((uint16_t)(now - last_press) < DEBOUNCE_MS)
+        return;
+    last_press = now;
+
+    orientation ^= 1;
+    render_clock();
+    shown_minute = minute;
+    eeprom_pending = 1;
+}
+
+ISR(USART_RXC_vect)
+{
+    uint8_t c = UDR;
+
+    if (rx_ready)
+        return;
+    if (!rx_active) {
+        if (c == '$') {
+            rx_len = 0;
+            rx_active = 1;
+        }
+        return;
+    }
+    if (c == '\r' || c == '\n') {
+        if (rx_len == 0)
+            return;
+        rx_active = 0;
+        rx_ready = 1;
+        return;
+    }
+    if (rx_len >= SETCLK_LEN) {
+        rx_active = 0;
+        rx_overflow = 1;
+    } else {
+        rx_buf[rx_len++] = c;
+    }
+}
+
 static void gpio_init(void)
 {
     DDRC |= (1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3) | (1 << PC4);
@@ -188,6 +362,7 @@ static void gpio_init(void)
     DDRB |= (1 << PB0) | (1 << PB2) | (1 << PB5);
 
     PORTC |= (1 << PC0) | (1 << PC1) | (1 << PC2) | (1 << PC3) | (1 << PC4);
+    PORTD |= (1 << PD2); /* pull-up en INT0 (pulsador a GND) */
     PORTD |= (1 << PD4) | (1 << PD5) | (1 << PD6) | (1 << PD7);
     PORTD &= ~(1 << PD3);
     PORTB &= ~((1 << PB0) | (1 << PB5));
@@ -206,16 +381,51 @@ static void timers_init(void)
     TIMSK |= (1 << OCIE2);
 }
 
+static void extint_init(void)
+{
+    MCUCR = (MCUCR & ~((1 << ISC01) | (1 << ISC00))) | (1 << ISC01);
+    GICR |= (1 << INT0);
+}
+
+static void uart_init(void)
+{
+    PORTD |= (1 << PD0); /* pull-up en RX */
+    DDRD |= (1 << PD1);  /* TX */
+    UBRRH = 0;
+    UBRRL = 51; /* 9600 bps con 8 MHz */
+    UCSRB = (1 << RXEN) | (1 << TXEN) | (1 << RXCIE);
+    UCSRC = (1 << URSEL) | (1 << UCSZ1) | (1 << UCSZ0); /* 8N1 */
+}
+
 int main(void)
 {
     gpio_init();
+
+    orientation = eeprom_read_byte(&ee_orientation);
+    if (orientation > 1)
+        orientation = 0;
+
     render_clock();
     shown_minute = minute;
     timers_init();
+    extint_init();
+    uart_init();
     sei();
 
-    for (;;)
-        ;
+    uart_puts("TAXILED 9600 READY\r\n");
+
+    for (;;) {
+        if (rx_overflow) {
+            rx_overflow = 0;
+            uart_puts("ERR LONG\r\n");
+        }
+        if (rx_ready)
+            setclk_apply();
+        if (eeprom_pending) {
+            eeprom_pending = 0;
+            eeprom_update_byte(&ee_orientation, orientation);
+        }
+    }
 
     return 0;
 }

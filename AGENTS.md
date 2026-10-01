@@ -22,13 +22,19 @@
 ## Architecture
 
 - Clock display app: shows `HH:MM` starting at 12:00 (24 h), rendered from the font table in `docs/Digitos_5x4.ods` (5 rows × 4 cols, LSB = leftmost column; 12 glyphs: 0–9, space, colon).
-- Two ISRs, all work happens in ISRs (`main()` only initializes):
-  - `TIMER2_COMP_vect` at **2 kHz (0.5 ms)** (CTC, prescaler 32, `OCR2=124`, 250 fps scan) — matrix scan: all columns off → `OE` high → shift 16 bits → `LE` pulse → `OE` low → active column on. The status-LED blink (100 ms on / 900 ms off) is stepped here from its tick counter.
+- ISRs do the timing-critical work; `main()`'s loop only runs the EEPROM write for the orientation flag and applies a complete `$SETCLK` line (both are too slow/long for ISR context):
+  - `TIMER2_COMP_vect` at **2 kHz (0.5 ms)** (CTC, prescaler 32, `OCR2=124`, 250 fps scan) — matrix scan: all columns off → `OE` high → shift 16 bits → `LE` pulse → `OE` low → active column on. Also steps the status-LED blink (100 ms on / 900 ms off) and a 1 ms tick counter (`ms_cnt`, for the INT0 debounce).
   - `TIMER1_COMPA_vect` at **1 Hz** (CTC, prescaler 256, `OCR1A=31249`) — seconds/minutes/hours tick; a full `render_clock()` rebuild happens only when the minute changes, otherwise only the colon pixels are toggled (1 Hz blink) — keeps per-second ISR stalls near zero. Note ATmega8's Timer2 has a single compare vector (`TIMER2_COMP`, not `COMPA`).
+  - `INT0_vect` (PD2, falling edge, `MCUCR ISC01=1 ISC00=0`) — orientation toggle: 150 ms debounce against `ms_cnt`, flip `orientation`, immediate `render_clock()`, set `eeprom_pending`. The EEPROM byte is written later from `main()` (3.4 ms write must not run in an ISR).
+  - `USART_RXC_vect` (9600 8N1, `UBRR=51`) — byte-level state machine only: starts at `$`, collects until CR/LF (second CRLF byte with empty buffer is ignored), over-long lines set `rx_overflow`. Validation + time apply happen in `main()` → `setclk_apply()`, which logs to TX: `RX <line>`, then `OK` or `ERR LEN/CMD/DIGIT/RANGE` (plus `ERR LONG` from the overflow flag, `TAXILED 9600 READY` banner at boot). Polled TX on PD1, called from `main()` only — never from an ISR.
   - **Timer2 prescaler trap**: unlike Timer1, Timer2's `CS22:0` table is 001=/1, 010=/8, **011=/32, 100=/64**, 101=/128, 110=/256, 111=/1024 (Timer1 has 011=/64, 100=/256). Writing `CS22|CS21` (110) means **/256, not /64** — that bug made the scan run at 31 fps and the display visibly flickered for a long time.
-  - `grp[]` is written in the Timer1 ISR and read in the Timer2 ISR; AVR ISRs don't nest, so the rebuild is atomic w.r.t. the scan — no locking needed as long as no framebuffer work moves into `main()`.
+  - Shared state (`grp[]`, `orientation`, time fields) is only ever touched from ISR context or inside `cli()/sei()` pairs — that is the concurrency discipline; don't read/write it bare from `main()`.
 - Framebuffer: `grp[8]` — one 16-bit word per column group, pixel `(col,row)` = bit `row + 5*(col%3)` in word `col/3` (from `docs/Matriz_5x24.ods`; group = voltage driver C0–C7, bit = constant-current output F0–F14, F15 unused).
-- Layout: `HH:MM` spans 23 columns from `CLOCK_COL0` 0: H1 @+0, gap 2, H2 @+6, gap 3 with the colon pixel in the middle (+11), gap 3, M1 @+13, gap 2, M2 @+19 (4+2+4+3+4+2+4). Colon (`COL_COLON` @+9, glyph pixel at +2) blinks once per second (visible on even seconds).
+- Orientation (persisted in EEPROM address 0, `ee_orientation`; virgin 0xFF → horizontal):
+  - **Horizontal** (0): `HH:MM` spans 23 columns from `CLOCK_COL0` 0: H1 @+0, gap 2, H2 @+6, gap 3 with the colon pixel in the middle (+11), gap 3, M1 @+13, gap 2, M2 @+19 (4+2+4+3+4+2+4).
+  - **Vertical** (1): digits rotated 90° CW by `draw_glyph_rot(col0,row0,glyph)` — original `(c,r)` → `(col0 + 4 - r, row0 + c)`, so a glyph is 5 col × 4 rows. Read top→bottom (col23→col0) as `Hh:Mm`: H @19-23, h @13-17, colon pixels @11-12 (row 2), M @6-10, m @0-4. Minute glyphs use `row0=1` (rows 1-4, one pixel right of the hours in rows 0-3) — `VC_MROW`. To rotate CCW instead, change the expression to `set_pixel(col0 + r, row0 + 3 - c)` (see comment in code).
+  - Colon (`COL_COLON` @+9 horizontal, `VC_COL_A/B` vertical) blinks once per second (visible on even seconds) in both orientations.
+- Serial command `$SETCLK,HHMMSS` (13 bytes after `$`): `setclk_apply()` checks exact length + `SETCLK,` prefix + 6 digits, HH 0-23, MM/SS 0-59; sets hour/min/sec + full render inside `cli()`; invalid lines are silently dropped.
 
 ## Hardware facts (verified, authoritative sources: `README.md` + `docs/DRV_A6282.PDF`)
 
@@ -37,8 +43,9 @@
 - Column switches are P-MOSFETs → **column pins are active low** (low = column on).
 - Status LED on **PB2 is active-low**; it is blinked from the 0.5 ms ISR: 100 ms on / 900 ms off.
 - PB5 doubles as ISP `SCK` (harmless at runtime).
+- PD2 is an input with internal pull-up — the orientation switch must be wired **PD2 → switch → GND** (falling edge = press). PD0 is the UART RX with pull-up; PD1 is the UART TX (activity log, 9600 8N1).
 
 ## Conventions
 
 - Docs (`README.md`, etc.) are Spanish; `AGENTS.md` stays English.
-- Display layout tunables live as `#define`s at the top of `src/main.c` (`CLOCK_COL0`, LED blink window).
+- Display layout tunables live as `#define`s at the top of `src/main.c` (`CLOCK_COL0`/`VC_*`, LED blink window, `DEBOUNCE_MS`, `SETCLK_LEN`).
