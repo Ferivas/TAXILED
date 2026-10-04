@@ -10,6 +10,16 @@
 #define LED_ON_TICKS 200
 #define DEBOUNCE_MS 150
 
+/* Scroll de dígitos: desplazamiento vertical, 5 filas, una cada 200 ms,
+   empezando 1 s antes del cambio. En cada paso todo el contenido sube una
+   fila (la fila de arriba sale) y por abajo entra la siguiente fila del
+   dígito nuevo (primero su fila 0). Timer1 corre a 200 ms (OCR1A=6249,
+   prescaler 256) y el ISR divide entre TICKS_PER_SEC para el reloj de 1 Hz.
+   La ventana tras k pasos es: fila j muestra stream[k+j], con
+   stream[0..4] = glifo viejo y stream[5..9] = glifo nuevo. */
+#define SCROLL_ROWS 5
+#define TICKS_PER_SEC 5
+
 /* HH:MM horizontal ocupa 23 columnas: 4 + 2 + 4 + 3 + 4 + 2 + 4 */
 #define CLOCK_COL0 0
 #define COL_H1 (CLOCK_COL0 + 0)
@@ -59,9 +69,16 @@ static uint8_t group;
 static uint16_t led_cnt;
 static uint8_t hour = 12;
 static uint8_t minute;
-static uint8_t second;
+static uint8_t second = 50; /* arranque 12:00:50: primer cambio a los 10 s */
 static uint8_t shown_minute;
 static uint8_t colon_shown;
+static uint8_t tick_div;
+
+/* Scroll: glifos viejo/nuevo por posición (0=H dec, 1=H un, 2=M dec, 3=M un) */
+static uint8_t anim_mask;
+static uint8_t anim_k;
+static uint8_t anim_old[4];
+static uint8_t anim_new[4];
 
 static volatile uint8_t orientation;
 static volatile uint8_t eeprom_pending;
@@ -121,6 +138,43 @@ static void draw_glyph(uint8_t col0, uint8_t glyph)
         for (uint8_t c = 0; c < 4; c++)
             if (bits & (1 << c))
                 set_pixel(col0 + c, r);
+    }
+}
+
+/* Dibuja la fila `frow` del glifo en el hueco de fila `slot` del dígito
+   (rot=1: 90° horario). frow y slot difieren mientras hay scroll. */
+static void draw_glyph_slot(uint8_t col0, uint8_t row0, uint8_t glyph,
+                            uint8_t frow, uint8_t slot, uint8_t rot)
+{
+    uint8_t bits = font[glyph][frow];
+
+    for (uint8_t c = 0; c < 4; c++)
+        if (bits & (1 << c))
+            set_pixel(rot ? col0 + (4 - slot) : col0 + c,
+                      row0 + (rot ? c : slot));
+}
+
+static void clear_glyph_slot(uint8_t col0, uint8_t row0, uint8_t glyph,
+                             uint8_t frow, uint8_t slot, uint8_t rot)
+{
+    uint8_t bits = font[glyph][frow];
+
+    for (uint8_t c = 0; c < 4; c++)
+        if (bits & (1 << c))
+            clear_pixel(rot ? col0 + (4 - slot) : col0 + c,
+                        row0 + (rot ? c : slot));
+}
+
+static void slot_pos(uint8_t s, uint8_t *col0, uint8_t *row0)
+{
+    if (orientation) {
+        *row0 = (s < 2) ? 0 : VC_MROW;
+        *col0 = (s == 0) ? VC_H1 : (s == 1) ? VC_H2
+                           : (s == 2) ? VC_M1 : VC_M2;
+    } else {
+        *row0 = 0;
+        *col0 = (s == 0) ? COL_H1 : (s == 1) ? COL_H2
+                           : (s == 2) ? COL_M1 : COL_M2;
     }
 }
 
@@ -186,6 +240,60 @@ static void clock_tick(void)
         return;
     minute = 0;
     hour = (hour + 1) % 24;
+}
+
+/* Prepara el scroll: compara cada dígito actual con el valor en +1 s. */
+static void prepare_scroll(void)
+{
+    uint8_t nhour = hour;
+    uint8_t nmin = minute + 1;
+
+    if (nmin == 60) {
+        nmin = 0;
+        nhour = (hour + 1) % 24;
+    }
+
+    anim_old[0] = hour / 10;
+    anim_old[1] = hour % 10;
+    anim_old[2] = minute / 10;
+    anim_old[3] = minute % 10;
+    anim_new[0] = nhour / 10;
+    anim_new[1] = nhour % 10;
+    anim_new[2] = nmin / 10;
+    anim_new[3] = nmin % 10;
+
+    anim_mask = 0;
+    for (uint8_t s = 0; s < 4; s++)
+        if (anim_new[s] != anim_old[s])
+            anim_mask |= (1 << s);
+    anim_k = 0;
+}
+
+/* Un paso de scroll (anim_k ya incrementado, 1..5): cada hueco de fila j
+   pasa de mostrar stream[k-1+j] a stream[k+j]; lo que se va se borra y lo
+   que llega se dibuja. */
+static void scroll_redraw(void)
+{
+    uint8_t k = anim_k;
+
+    for (uint8_t s = 0; s < 4; s++) {
+        uint8_t col0, row0;
+
+        if (!(anim_mask & (1 << s)))
+            continue;
+        slot_pos(s, &col0, &row0);
+        for (uint8_t j = 0; j < SCROLL_ROWS; j++) {
+            uint8_t pi = (k - 1) + j;
+            uint8_t ni = k + j;
+
+            clear_glyph_slot(col0, row0,
+                             pi < 5 ? anim_old[s] : anim_new[s],
+                             pi < 5 ? pi : pi - 5, j, orientation);
+            draw_glyph_slot(col0, row0,
+                            ni < 5 ? anim_old[s] : anim_new[s],
+                            ni < 5 ? ni : ni - 5, j, orientation);
+        }
+    }
 }
 
 static void shift_word(uint16_t w)
@@ -259,6 +367,7 @@ static void setclk_apply(void)
     hour = hh;
     minute = mm;
     second = ss;
+    anim_mask = 0;
     render_clock();
     shown_minute = minute;
     sei();
@@ -268,16 +377,28 @@ static void setclk_apply(void)
 
 ISR(TIMER1_COMPA_vect)
 {
-    clock_tick();
-    if (minute != shown_minute) {
-        render_clock();
-        shown_minute = minute;
-    } else {
-        uint8_t want = (second & 1) == 0;
-        if (want != colon_shown) {
-            colon_shown = want;
-            colon_pixels(want);
+    if (++tick_div == TICKS_PER_SEC) {
+        tick_div = 0;
+        clock_tick();
+        if (minute != shown_minute) {
+            render_clock();
+            shown_minute = minute;
+        } else {
+            uint8_t want = (second & 1) == 0;
+            if (want != colon_shown) {
+                colon_shown = want;
+                colon_pixels(want);
+            }
         }
+        if (second == 59 && !anim_mask)
+            prepare_scroll();
+    }
+
+    if (anim_mask && anim_k < SCROLL_ROWS) {
+        anim_k++;
+        scroll_redraw();
+        if (anim_k == SCROLL_ROWS)
+            anim_mask = 0;
     }
 }
 
@@ -322,6 +443,7 @@ ISR(INT0_vect)
     last_press = now;
 
     orientation ^= 1;
+    anim_mask = 0;
     render_clock();
     shown_minute = minute;
     eeprom_pending = 1;
@@ -373,7 +495,7 @@ static void timers_init(void)
 {
     TCCR1A = 0;
     TCCR1B = (1 << WGM12) | (1 << CS12);
-    OCR1A = 31249;
+    OCR1A = 6249; /* 200 ms: el ISR divide entre TICKS_PER_SEC (1 Hz) */
     TIMSK |= (1 << OCIE1A);
 
     TCCR2 = (1 << WGM21) | (1 << CS21) | (1 << CS20); /* /32 */
